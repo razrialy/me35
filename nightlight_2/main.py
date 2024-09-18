@@ -1,8 +1,10 @@
 # The base of this code comes from code used from the previous
 # nightlight project that was written by Aengus Kennedy & Rachael Azrialy.
-
 # The code was edited to add more features to the nightlight and was added
 # by Rachael Azrialy.
+
+# Guidance on asyncio and stepper motors was provided by ChatGPT and 
+# resources created by Chris Rogers were used.
 
 from machine import Pin, PWM, I2C
 import neopixel
@@ -28,7 +30,7 @@ if True:
 
     print('\nWi-Fi connection successful: {}'.format(wlan.ifconfig()))
 
-
+# Acceleration class to get the MSA311 Accelerometer working
 class Acceleration:
     def __init__(self, scl, sda, addr=0x62):
         self.addr = addr
@@ -65,14 +67,17 @@ class NightLightAsync:
             (brightness, brightness, brightness)  # White
         ]
         self.running = False
+        
+        # Buzzer setup
         self.buzzer = PWM(Pin('GPIO18', Pin.OUT))
         self.buzzer.freq(880)
         self.buzzer.duty_u16(0)
+        
         self.button = Pin(28, Pin.IN, Pin.PULL_DOWN)  # External button on GPIO 28
         self.neopixel = neopixel.NeoPixel(Pin(28), 1)
         self.leds = [Pin(pin, Pin.OUT) for pin in [27, 22, 17]]
         
-        # Setup Stepper Motor (Pin 15)
+        # Motor setup
         self.stepper = PWM(Pin(15))
         self.stepper.freq(50)  # Set frequency for stepper motor
 
@@ -82,9 +87,14 @@ class NightLightAsync:
         # Store initial reading
         self.last_reading = self.accel.read_accel()
 
-        # Movement threshold
-        self.threshold = 2000  # Adjust this to be more or less sensitive
+        # Accelerometer threshold
+        self.threshold = 2000  # Decrease to be more sensitive
 
+        # Initialize MQTT clients
+        self.mqtt_sub_client = None
+        self.mqtt_pub_client = None
+        
+		# Breathe (dim/brighten) LED on the board
     async def breathe(self, gpio_pin):
         led = PWM(Pin(gpio_pin, Pin.OUT))
         led.freq(50)
@@ -95,16 +105,23 @@ class NightLightAsync:
                     await asyncio.sleep(0.01)
             else:
                 led.duty_u16(0)
+                
+            if self.button.value() == 1:
+                print("Button pressed, sending 'hello'")
+                await self.send_message('ME35-24/kronk', 'hello')
+                    
             await asyncio.sleep(threadsleep)
-
+		
+		# Beep the buzzer on the board at a certain frequency for a specific duration
     async def beep(self, duration=0.25, freq=880):
         self.buzzer.freq(freq)
         self.buzzer.duty_u16(1000)
         await asyncio.sleep(duration)
         self.buzzer.duty_u16(0)
-
+		
+		# Play part of the song Thriller. The notes were provided by ChatGPT
     async def play_thriller(self):
-        # Approximated melody for the intro of "Thriller"
+        # Approximated melody for the intro of Thriller
         notes = [
             (659, 0.5), (622, 0.5), (587, 0.5), (466, 1.0),  # First part of intro
             (659, 0.5), (622, 0.5), (587, 0.5), (466, 1.0),  # Repeat
@@ -112,10 +129,11 @@ class NightLightAsync:
         ]
         for freq, duration in notes:
             await self.beep(duration=duration, freq=freq)
-
+		
+		# Spin the motor in a sweeping motion
     async def spin_motor(self, duration=5):
         for i in range(2):
-            # Rotate the motor in a full sweep
+            # Rotate the motor
             for angle in range(0, 181, 10):
                 self.set_servo_angle(angle)
                 await asyncio.sleep(0.05)
@@ -123,18 +141,20 @@ class NightLightAsync:
             for angle in range(180, 4, -10):
                 self.set_servo_angle(angle)
                 await asyncio.sleep(0.05)
-            self.stepper.deinit()
-
+            self.stepper.deinit() # Turn off PWM pin
+		
+		# Set the angle the servo motor should go to
     def set_servo_angle(self, angle):
         # Map angle (0-180) to PWM duty cycle (1000-9000)
         duty = 1000 + int((angle / 180) * 8000)
         self.stepper.duty_u16(duty)
-
+		
+		# Turn off or on the LEDs
     def state_leds(self, state):
-        """ Turn LEDs on or off based on the state. """
         for led in self.leds:
             led.value(1 if state else 0)
-
+		
+		# Turn on the neopixel & cycle through different colors
     async def cycle_neopixel(self):
         while True:
             if self.running:
@@ -157,7 +177,8 @@ class NightLightAsync:
                 self.buzzer.duty_u16(0)
 
             await asyncio.sleep(threadsleep)
-
+		
+		# Check the accelerometer readings to see if it has been tapped
     async def check_acceleration(self):
         last_accel = self.accel.read_accel()
         
@@ -169,7 +190,7 @@ class NightLightAsync:
                 abs(current_reading[1] - last_accel[1]) > self.threshold or
                 abs(current_reading[2] - last_accel[2]) > self.threshold):
                 if self.running:
-                    # Play "Thriller" and spin motor
+                    # Play Thriller and spin motor
                     thriller_task = asyncio.create_task(self.play_thriller())
                     motor_task = asyncio.create_task(self.spin_motor(duration=5))
 
@@ -186,21 +207,37 @@ class NightLightAsync:
 
         def callback(topic, msg):
             topic, msg = topic.decode(), msg.decode()
-            print(topic, msg)
+            print("Received message:", topic, msg)
             if msg == 'start':
                 self.running = True
             elif msg == 'stop':
                 self.running = False
-                
-        client = MQTTClient('ME35_chris', mqtt_broker, port, keepalive=60)
-        client.set_callback(callback)
-        client.connect()
-        client.subscribe(topic.encode())
+            elif msg == 'hello':
+                print("Turning on LEDs in response to 'hello'")
+                self.state_leds(True)
+
+        self.mqtt_sub_client = MQTTClient('ME35_chris_sub', mqtt_broker, port, keepalive=60)
+        self.mqtt_sub_client.set_callback(callback)
+        self.mqtt_sub_client.connect()
+        self.mqtt_sub_client.subscribe(topic.encode())
 
         while True:
-            client.check_msg()
+            self.mqtt_sub_client.check_msg()
             await asyncio.sleep(threadsleep)
 
+    async def send_message(self, topic, message):
+        mqtt_broker = 'broker.hivemq.com'
+        port = 1883
+        if self.mqtt_pub_client is None:
+            self.mqtt_pub_client = MQTTClient('ME35_chris_pub', mqtt_broker, port, keepalive=60)
+            self.mqtt_pub_client.connect()
+        self.mqtt_pub_client.publish(topic, message)
+        print(f"Message '{message}' sent to topic '{topic}'")
+        await asyncio.sleep(0.1)  # Allow some time for the message to be sent
+        self.mqtt_pub_client.disconnect()
+        self.mqtt_pub_client = None
+
+# Main code that runs
 if True:
     nl = NightLightAsync()
 
@@ -212,4 +249,3 @@ if True:
     thread.create_task(nl.mqtt_subscribe())
 
     thread.run_forever()
-
